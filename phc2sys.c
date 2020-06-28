@@ -56,18 +56,13 @@
 #include "uds.h"
 #include "util.h"
 #include "version.h"
+#include "contain.h"
 
 #define KP 0.7
 #define KI 0.3
 #define NS_PER_SEC 1000000000LL
 
 #define PHC_PPS_OFFSET_LIMIT 10000000
-#define PMC_UPDATE_INTERVAL (60 * NS_PER_SEC)
-#define PMC_SUBSCRIBE_DURATION 180	/* 3 minutes */
-/* Note that PMC_SUBSCRIBE_DURATION has to be longer than
- * PMC_UPDATE_INTERVAL otherwise subscription will time out before it is
- * renewed.
- */
 
 struct clock {
 	LIST_ENTRY(clock) list;
@@ -105,17 +100,10 @@ struct phc2sys_private {
 	enum servo_type servo_type;
 	int phc_readings;
 	double phc_interval;
-	int sync_offset;
 	int forced_sync_offset;
-	int utc_offset_traceable;
-	int leap;
 	int kernel_leap;
-	struct pmc *pmc;
-	int pmc_ds_requested;
-	uint64_t pmc_last_update;
 	int state_changed;
-	int clock_identity_set;
-	struct ClockIdentity clock_identity;
+	struct pmc_node node;
 	LIST_HEAD(port_head, port) ports;
 	LIST_HEAD(clock_head, clock) clocks;
 	LIST_HEAD(dst_clock_head, clock) dst_clocks;
@@ -124,18 +112,11 @@ struct phc2sys_private {
 
 static struct config *phc2sys_config;
 
-static int update_pmc(struct phc2sys_private *priv, int subscribe);
 static int clock_handle_leap(struct phc2sys_private *priv,
 			     struct clock *clock,
 			     int64_t offset, uint64_t ts);
-static int run_pmc_get_utc_offset(struct phc2sys_private *priv,
-				  int timeout);
-static void run_pmc_events(struct phc2sys_private *priv);
 
 static int normalize_state(int state);
-static int run_pmc_port_properties(struct phc2sys_private *priv,
-				   int timeout, unsigned int port,
-				   int *state, int *tstamping, char *iface);
 
 static struct servo *servo_add(struct phc2sys_private *priv,
 			       struct clock *clock)
@@ -324,7 +305,7 @@ static void clock_reinit(struct phc2sys_private *priv, struct clock *clock,
 
 	LIST_FOREACH(p, &priv->ports, list) {
 		if (p->clock == clock) {
-			ret = run_pmc_port_properties(priv, 1000, p->number,
+			ret = run_pmc_port_properties(&priv->node, 1000, p->number,
 					              &state, &timestamping,
 						      iface);
 			if (ret > 0)
@@ -659,7 +640,7 @@ static int do_pps_loop(struct phc2sys_private *priv, struct clock *clock,
 
 	if (src == CLOCK_INVALID) {
 		/* The sync offset can't be applied with PPS alone. */
-		priv->sync_offset = 0;
+		priv->node.sync_offset = 0;
 	} else {
 		enable_pps_output(priv->master->clkid);
 	}
@@ -690,7 +671,7 @@ static int do_pps_loop(struct phc2sys_private *priv, struct clock *clock,
 			pps_offset = pps_ts - phc_ts;
 		}
 
-		if (update_pmc(priv, 0) < 0)
+		if (update_pmc_node(&priv->node, 0) < 0)
 			continue;
 		update_clock(priv, clock, pps_offset, pps_ts, -1);
 	}
@@ -727,15 +708,15 @@ static int do_loop(struct phc2sys_private *priv, int subscriptions)
 
 	while (is_running()) {
 		clock_nanosleep(CLOCK_MONOTONIC, 0, &interval, NULL);
-		if (update_pmc(priv, subscriptions) < 0)
+		if (update_pmc_node(&priv->node, subscriptions) < 0)
 			continue;
 
 		if (subscriptions) {
-			run_pmc_events(priv);
+			run_pmc_events(&priv->node);
 			if (priv->state_changed) {
 				/* force getting offset, as it may have
 				 * changed after the port state change */
-				if (run_pmc_get_utc_offset(priv, 1000) <= 0) {
+				if (run_pmc_get_utc_offset(&priv->node, 1000) <= 0) {
 					pr_err("failed to get UTC offset");
 					continue;
 				}
@@ -792,53 +773,6 @@ static int do_loop(struct phc2sys_private *priv, int subscriptions)
 	return 0;
 }
 
-static int check_clock_identity(struct phc2sys_private *priv,
-				struct ptp_message *msg)
-{
-	if (!priv->clock_identity_set)
-		return 1;
-	return cid_eq(&priv->clock_identity,
-		       &msg->header.sourcePortIdentity.clockIdentity);
-}
-
-static int is_msg_mgt(struct ptp_message *msg)
-{
-	struct TLV *tlv;
-
-	if (msg_type(msg) != MANAGEMENT)
-		return 0;
-	if (management_action(msg) != RESPONSE)
-		return 0;
-	if (msg_tlv_count(msg) != 1)
-		return 0;
-	tlv = (struct TLV *) msg->management.suffix;
-	if (tlv->type == TLV_MANAGEMENT)
-		return 1;
-	if (tlv->type == TLV_MANAGEMENT_ERROR_STATUS)
-		return -1;
-	return 0;
-}
-
-static int get_mgt_id(struct ptp_message *msg)
-{
-	struct management_tlv *mgt = (struct management_tlv *) msg->management.suffix;
-	return mgt->id;
-}
-
-static void *get_mgt_data(struct ptp_message *msg)
-{
-	struct management_tlv *mgt = (struct management_tlv *) msg->management.suffix;
-	return mgt->data;
-}
-
-static int get_mgt_err_id(struct ptp_message *msg)
-{
-	struct management_error_status *mgt;
-
-	mgt = (struct management_error_status *)msg->management.suffix;
-	return mgt->id;
-}
-
 static int normalize_state(int state)
 {
 	if (state != PS_MASTER && state != PS_SLAVE &&
@@ -868,9 +802,13 @@ static int clock_compute_state(struct phc2sys_private *priv,
 	return state;
 }
 
-static int recv_subscribed(struct phc2sys_private *priv,
-			   struct ptp_message *msg, int excluded)
+#define node_to_phc2sys(node) \
+	container_of(node, struct phc2sys_private, node)
+
+static int phc2sys_recv_subscribed(struct pmc_node *node,
+				   struct ptp_message *msg, int excluded)
 {
+	struct phc2sys_private *priv = node_to_phc2sys(node);
 	int mgt_id, state;
 	struct portDS *pds;
 	struct port *port;
@@ -905,259 +843,6 @@ static int recv_subscribed(struct phc2sys_private *priv,
 	return 0;
 }
 
-static void send_subscription(struct phc2sys_private *priv)
-{
-	struct subscribe_events_np sen;
-
-	memset(&sen, 0, sizeof(sen));
-	sen.duration = PMC_SUBSCRIBE_DURATION;
-	sen.bitmask[0] = 1 << NOTIFY_PORT_STATE;
-	pmc_send_set_action(priv->pmc, TLV_SUBSCRIBE_EVENTS_NP, &sen, sizeof(sen));
-}
-
-static int init_pmc(struct config *cfg, struct phc2sys_private *priv)
-{
-	char uds_local[MAX_IFNAME_SIZE + 1];
-
-	snprintf(uds_local, sizeof(uds_local), "/var/run/phc2sys.%d",
-		 getpid());
-	priv->pmc = pmc_create(cfg, TRANS_UDS, uds_local, 0,
-			       config_get_int(cfg, NULL, "domainNumber"),
-			       config_get_int(cfg, NULL, "transportSpecific") << 4, 1);
-	if (!priv->pmc) {
-		pr_err("failed to create pmc");
-		return -1;
-	}
-
-	return 0;
-}
-
-/* Return values:
- * 1: success
- * 0: timeout
- * -1: error reported by the other side
- * -2: local error, fatal
- */
-static int run_pmc(struct phc2sys_private *priv, int timeout, int ds_id,
-		   struct ptp_message **msg)
-{
-#define N_FD 1
-	struct pollfd pollfd[N_FD];
-	int cnt, res;
-
-	while (1) {
-		pollfd[0].fd = pmc_get_transport_fd(priv->pmc);
-		pollfd[0].events = POLLIN|POLLPRI;
-		if (!priv->pmc_ds_requested && ds_id >= 0)
-			pollfd[0].events |= POLLOUT;
-
-		cnt = poll(pollfd, N_FD, timeout);
-		if (cnt < 0) {
-			pr_err("poll failed");
-			return -2;
-		}
-		if (!cnt) {
-			/* Request the data set again in the next run. */
-			priv->pmc_ds_requested = 0;
-			return 0;
-		}
-
-		/* Send a new request if there are no pending messages. */
-		if ((pollfd[0].revents & POLLOUT) &&
-		    !(pollfd[0].revents & (POLLIN|POLLPRI))) {
-			switch (ds_id) {
-			case TLV_SUBSCRIBE_EVENTS_NP:
-				send_subscription(priv);
-				break;
-			default:
-				pmc_send_get_action(priv->pmc, ds_id);
-				break;
-			}
-			priv->pmc_ds_requested = 1;
-		}
-
-		if (!(pollfd[0].revents & (POLLIN|POLLPRI)))
-			continue;
-
-		*msg = pmc_recv(priv->pmc);
-
-		if (!*msg)
-			continue;
-
-		if (!check_clock_identity(priv, *msg)) {
-			msg_put(*msg);
-			*msg = NULL;
-			continue;
-		}
-
-		res = is_msg_mgt(*msg);
-		if (res < 0 && get_mgt_err_id(*msg) == ds_id) {
-			priv->pmc_ds_requested = 0;
-			return -1;
-		}
-		if (res <= 0 || recv_subscribed(priv, *msg, ds_id) ||
-		    get_mgt_id(*msg) != ds_id) {
-			msg_put(*msg);
-			*msg = NULL;
-			continue;
-		}
-		priv->pmc_ds_requested = 0;
-		return 1;
-	}
-}
-
-static int run_pmc_wait_sync(struct phc2sys_private *priv, int timeout)
-{
-	struct ptp_message *msg;
-	int res;
-	void *data;
-	Enumeration8 portState;
-
-	while (1) {
-		res = run_pmc(priv, timeout, TLV_PORT_DATA_SET, &msg);
-		if (res <= 0)
-			return res;
-
-		data = get_mgt_data(msg);
-		portState = ((struct portDS *)data)->portState;
-		msg_put(msg);
-
-		switch (portState) {
-		case PS_MASTER:
-		case PS_SLAVE:
-			return 1;
-		}
-		/* try to get more data sets (for other ports) */
-		priv->pmc_ds_requested = 1;
-	}
-}
-
-static int run_pmc_get_utc_offset(struct phc2sys_private *priv, int timeout)
-{
-	struct ptp_message *msg;
-	int res;
-	struct timePropertiesDS *tds;
-
-	res = run_pmc(priv, timeout, TLV_TIME_PROPERTIES_DATA_SET, &msg);
-	if (res <= 0)
-		return res;
-
-	tds = (struct timePropertiesDS *)get_mgt_data(msg);
-	if (tds->flags & PTP_TIMESCALE) {
-		priv->sync_offset = tds->currentUtcOffset;
-		if (tds->flags & LEAP_61)
-			priv->leap = 1;
-		else if (tds->flags & LEAP_59)
-			priv->leap = -1;
-		else
-			priv->leap = 0;
-		priv->utc_offset_traceable = tds->flags & UTC_OFF_VALID &&
-					     tds->flags & TIME_TRACEABLE;
-	} else {
-		priv->sync_offset = 0;
-		priv->leap = 0;
-		priv->utc_offset_traceable = 0;
-	}
-	msg_put(msg);
-	return 1;
-}
-
-static int run_pmc_get_number_ports(struct phc2sys_private *priv, int timeout)
-{
-	struct ptp_message *msg;
-	int res;
-	struct defaultDS *dds;
-
-	res = run_pmc(priv, timeout, TLV_DEFAULT_DATA_SET, &msg);
-	if (res <= 0)
-		return res;
-
-	dds = (struct defaultDS *)get_mgt_data(msg);
-	res = dds->numberPorts;
-	msg_put(msg);
-	return res;
-}
-
-static int run_pmc_subscribe(struct phc2sys_private *priv, int timeout)
-{
-	struct ptp_message *msg;
-	int res;
-
-	res = run_pmc(priv, timeout, TLV_SUBSCRIBE_EVENTS_NP, &msg);
-	if (res <= 0)
-		return res;
-	msg_put(msg);
-	return 1;
-}
-
-static void run_pmc_events(struct phc2sys_private *priv)
-{
-	struct ptp_message *msg;
-
-	run_pmc(priv, 0, -1, &msg);
-}
-
-static int run_pmc_port_properties(struct phc2sys_private *priv, int timeout,
-				   unsigned int port,
-				   int *state, int *tstamping, char *iface)
-{
-	struct ptp_message *msg;
-	int res, len;
-	struct port_properties_np *ppn;
-
-	pmc_target_port(priv->pmc, port);
-	while (1) {
-		res = run_pmc(priv, timeout, TLV_PORT_PROPERTIES_NP, &msg);
-		if (res <= 0)
-			goto out;
-
-		ppn = get_mgt_data(msg);
-		if (ppn->portIdentity.portNumber != port) {
-			msg_put(msg);
-			continue;
-		}
-
-		*state = ppn->port_state;
-		*tstamping = ppn->timestamping;
-		len = ppn->interface.length;
-		if (len > IFNAMSIZ - 1)
-			len = IFNAMSIZ - 1;
-		memcpy(iface, ppn->interface.text, len);
-		iface[len] = '\0';
-
-		msg_put(msg);
-		res = 1;
-		break;
-	}
-out:
-	pmc_target_all(priv->pmc);
-	return res;
-}
-
-static int run_pmc_clock_identity(struct phc2sys_private *priv, int timeout)
-{
-	struct ptp_message *msg;
-	struct defaultDS *dds;
-	int res;
-
-	res = run_pmc(priv, timeout, TLV_DEFAULT_DATA_SET, &msg);
-	if (res <= 0)
-		return res;
-
-	dds = (struct defaultDS *)get_mgt_data(msg);
-	memcpy(&priv->clock_identity, &dds->clockIdentity,
-	       sizeof(struct ClockIdentity));
-	priv->clock_identity_set = 1;
-	msg_put(msg);
-	return 1;
-}
-
-static void close_pmc(struct phc2sys_private *priv)
-{
-	pmc_destroy(priv->pmc);
-	priv->pmc = NULL;
-}
-
 static int auto_init_ports(struct phc2sys_private *priv, int add_rt)
 {
 	struct port *port;
@@ -1170,7 +855,7 @@ static int auto_init_ports(struct phc2sys_private *priv, int add_rt)
 	while (1) {
 		if (!is_running())
 			return -1;
-		res = run_pmc_clock_identity(priv, 1000);
+		res = run_pmc_clock_identity(&priv->node, 1000);
 		if (res < 0)
 			return -1;
 		if (res > 0)
@@ -1179,20 +864,20 @@ static int auto_init_ports(struct phc2sys_private *priv, int add_rt)
 		pr_notice("Waiting for ptp4l...");
 	}
 
-	number_ports = run_pmc_get_number_ports(priv, 1000);
+	number_ports = run_pmc_get_number_ports(&priv->node, 1000);
 	if (number_ports <= 0) {
 		pr_err("failed to get number of ports");
 		return -1;
 	}
 
-	res = run_pmc_subscribe(priv, 1000);
+	res = run_pmc_subscribe(&priv->node, 1000);
 	if (res <= 0) {
 		pr_err("failed to subscribe");
 		return -1;
 	}
 
 	for (i = 1; i <= number_ports; i++) {
-		res = run_pmc_port_properties(priv, 1000, i, &state,
+		res = run_pmc_port_properties(&priv->node, 1000, i, &state,
 					      &timestamping, iface);
 		if (res == -1) {
 			/* port does not exist, ignore the port */
@@ -1229,34 +914,10 @@ static int auto_init_ports(struct phc2sys_private *priv, int add_rt)
 	}
 
 	/* get initial offset */
-	if (run_pmc_get_utc_offset(priv, 1000) <= 0) {
+	if (run_pmc_get_utc_offset(&priv->node, 1000) <= 0) {
 		pr_err("failed to get UTC offset");
 		return -1;
 	}
-	return 0;
-}
-
-/* Returns: -1 in case of error, 0 otherwise */
-static int update_pmc(struct phc2sys_private *priv, int subscribe)
-{
-	struct timespec tp;
-	uint64_t ts;
-
-	if (clock_gettime(CLOCK_MONOTONIC, &tp)) {
-		pr_err("failed to read clock: %m");
-		return -1;
-	}
-	ts = tp.tv_sec * NS_PER_SEC + tp.tv_nsec;
-
-	if (priv->pmc &&
-	    !(ts > priv->pmc_last_update &&
-	      ts - priv->pmc_last_update < PMC_UPDATE_INTERVAL)) {
-		if (subscribe)
-			run_pmc_subscribe(priv, 0);
-		if (run_pmc_get_utc_offset(priv, 0) > 0)
-			priv->pmc_last_update = ts;
-	}
-
 	return 0;
 }
 
@@ -1264,9 +925,9 @@ static int update_pmc(struct phc2sys_private *priv, int subscribe)
 static int clock_handle_leap(struct phc2sys_private *priv, struct clock *clock,
 			     int64_t offset, uint64_t ts)
 {
-	int clock_leap, node_leap = priv->leap;
+	int clock_leap, node_leap = priv->node.leap;
 
-	clock->sync_offset = priv->sync_offset;
+	clock->sync_offset = priv->node.sync_offset;
 
 	if ((node_leap || clock->leap_set) &&
 	    clock->is_utc != priv->master->is_utc) {
@@ -1307,7 +968,7 @@ static int clock_handle_leap(struct phc2sys_private *priv, struct clock *clock,
 		}
 	}
 
-	if (priv->utc_offset_traceable &&
+	if (priv->node.utc_offset_traceable &&
 	    clock->utc_offset_set != clock->sync_offset) {
 		if (clock->clkid == CLOCK_REALTIME)
 			sysclk_set_tai_offset(clock->sync_offset);
@@ -1361,6 +1022,7 @@ static void usage(char *progname)
 int main(int argc, char *argv[])
 {
 	char *config = NULL, *dst_name = NULL, *progname, *src_name = NULL;
+	char uds_local[MAX_IFNAME_SIZE + 1];
 	struct clock *src, *dst;
 	struct config *cfg;
 	struct option *opts;
@@ -1469,7 +1131,7 @@ int main(int argc, char *argv[])
 				goto end;
 			break;
 		case 'O':
-			if (get_arg_val_i(c, optarg, &priv.sync_offset,
+			if (get_arg_val_i(c, optarg, &priv.node.sync_offset,
 					  INT_MIN, INT_MAX))
 				goto end;
 			priv.forced_sync_offset = -1;
@@ -1589,8 +1251,12 @@ int main(int argc, char *argv[])
 	priv.kernel_leap = config_get_int(cfg, NULL, "kernel_leap");
 	priv.sanity_freq_limit = config_get_int(cfg, NULL, "sanity_freq_limit");
 
+	snprintf(uds_local, sizeof(uds_local), "/var/run/phc2sys.%d",
+		 getpid());
+
 	if (autocfg) {
-		if (init_pmc(cfg, &priv))
+		if (init_pmc_node(cfg, &priv.node, uds_local,
+				  phc2sys_recv_subscribed))
 			goto end;
 		if (auto_init_ports(&priv, rt) < 0)
 			goto end;
@@ -1627,11 +1293,12 @@ int main(int argc, char *argv[])
 	r = -1;
 
 	if (wait_sync) {
-		if (init_pmc(cfg, &priv))
+		if (init_pmc_node(cfg, &priv.node, uds_local,
+				  phc2sys_recv_subscribed))
 			goto end;
 
 		while (is_running()) {
-			r = run_pmc_wait_sync(&priv, 1000);
+			r = run_pmc_wait_sync(&priv.node, 1000);
 			if (r < 0)
 				goto end;
 			if (r > 0)
@@ -1641,7 +1308,7 @@ int main(int argc, char *argv[])
 		}
 
 		if (!priv.forced_sync_offset) {
-			r = run_pmc_get_utc_offset(&priv, 1000);
+			r = run_pmc_get_utc_offset(&priv.node, 1000);
 			if (r <= 0) {
 				pr_err("failed to get UTC offset");
 				goto end;
@@ -1651,7 +1318,7 @@ int main(int argc, char *argv[])
 		if (priv.forced_sync_offset ||
 		    (src->clkid != CLOCK_REALTIME && dst->clkid != CLOCK_REALTIME) ||
 		    src->clkid == CLOCK_INVALID)
-			close_pmc(&priv);
+			close_pmc_node(&priv.node);
 	}
 
 	if (pps_fd >= 0) {
@@ -1664,8 +1331,7 @@ int main(int argc, char *argv[])
 	}
 
 end:
-	if (priv.pmc)
-		close_pmc(&priv);
+	close_pmc_node(&priv.node);
 	clock_cleanup(&priv);
 	port_cleanup(&priv);
 	config_destroy(cfg);
