@@ -23,13 +23,42 @@
 
 struct ts2phc_slave_array;
 
+#define SERVO_SYNC_INTERVAL    1.0
+
+struct clock {
+	LIST_ENTRY(clock) list;
+	LIST_ENTRY(clock) dst_list;
+	clockid_t clkid;
+	int phc_index;
+	int state;
+	int new_state;
+	int sync_offset;
+	int leap_set;
+	int utc_offset_set;
+	struct servo *servo;
+	enum servo_state servo_state;
+	char *name;
+	const char *source_label;
+	int no_adj;
+	int is_destination;
+	int is_pps_master;
+	struct timespec last_ts;
+	int is_ts_available;
+};
+
 struct ts2phc_private {
 	struct ts2phc_master *master;
 	STAILQ_HEAD(slave_ifaces_head, ts2phc_slave) slaves;
 	unsigned int n_slaves;
 	struct ts2phc_slave_array *polling_array;
 	struct config *cfg;
+	struct clock *source;
+	LIST_HEAD(clock_head, clock) clocks;
 };
+
+struct servo *servo_add(struct ts2phc_private *priv, struct clock *clock);
+struct clock *clock_add(struct ts2phc_private *priv, const char *device);
+void clock_add_tstamp(struct clock *clock, struct timespec ts);
 
 #include "ts2phc_master.h"
 #include "ts2phc_slave.h"
