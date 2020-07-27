@@ -702,6 +702,7 @@ static int do_loop(struct phc2sys_private *priv, int subscriptions)
 	struct clock *clock;
 	uint64_t ts;
 	int64_t offset, delay;
+	int err;
 
 	interval.tv_sec = priv->phc_interval;
 	interval.tv_nsec = (priv->phc_interval - interval.tv_sec) * 1e9;
@@ -712,7 +713,12 @@ static int do_loop(struct phc2sys_private *priv, int subscriptions)
 			continue;
 
 		if (subscriptions) {
-			run_pmc_events(&priv->node);
+			err = run_pmc_events(&priv->node);
+			if (err) {
+				pr_err("run_pmc_events returned %d", err);
+				return err;
+			}
+
 			if (priv->state_changed) {
 				/* force getting offset, as it may have
 				 * changed after the port state change */

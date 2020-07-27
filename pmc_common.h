@@ -76,7 +76,7 @@ int run_pmc_subscribe(struct pmc_node *node, int timeout);
 int run_pmc_clock_identity(struct pmc_node *node, int timeout);
 int run_pmc_wait_sync(struct pmc_node *node, int timeout);
 int run_pmc_get_number_ports(struct pmc_node *node, int timeout);
-void run_pmc_events(struct pmc_node *node);
+int run_pmc_events(struct pmc_node *node);
 int run_pmc_port_properties(struct pmc_node *node, int timeout,
 			    unsigned int port, int *state,
 			    int *tstamping, char *iface);
