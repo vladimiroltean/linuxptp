@@ -939,11 +939,16 @@ int run_pmc_subscribe(struct pmc_node *node, int timeout)
 	return 1;
 }
 
-void run_pmc_events(struct pmc_node *node)
+int run_pmc_events(struct pmc_node *node)
 {
 	struct ptp_message *msg;
+	int res;
 
-	run_pmc(node, 0, -1, &msg);
+	res = run_pmc(node, 0, -1, &msg);
+	if (res <= 0)
+		return res;
+	msg_put(msg);
+	return 1;
 }
 
 int run_pmc_port_properties(struct pmc_node *node, int timeout,
