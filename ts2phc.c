@@ -305,21 +305,106 @@ static int auto_init_ports(struct ts2phc_private *priv)
 	return 0;
 }
 
-static void ts2phc_synchronize_clocks(struct ts2phc_private *priv)
+static void ts2phc_reconfigure(struct ts2phc_private *priv)
+{
+	struct clock *c, *src = NULL, *last = NULL;
+	int src_cnt = 0, dst_cnt = 0;
+
+	pr_info("reconfiguring after port state change");
+	priv->state_changed = 0;
+
+	LIST_FOREACH(c, &priv->clocks, list) {
+		if (c->new_state) {
+			c->state = c->new_state;
+			c->new_state = 0;
+		}
+
+		switch (c->state) {
+		case PS_FAULTY:
+		case PS_DISABLED:
+		case PS_LISTENING:
+		case PS_PRE_MASTER:
+		case PS_MASTER:
+		case PS_PASSIVE:
+			if (!c->is_destination) {
+				pr_info("selecting %s for synchronization",
+					c->name);
+				c->is_destination = 1;
+			}
+			dst_cnt++;
+			break;
+		case PS_UNCALIBRATED:
+			src_cnt++;
+			break;
+		case PS_SLAVE:
+			src = c;
+			src_cnt++;
+			break;
+		}
+		last = c;
+	}
+	if (dst_cnt >= 1 && !src) {
+		priv->source = last;
+		/* Reset to original state in next reconfiguration. */
+		priv->source->new_state = priv->source->state;
+		priv->source->state = PS_SLAVE;
+		pr_info("no source, selecting %s as the default clock",
+			last->name);
+		return;
+	}
+	if (src_cnt > 1) {
+		pr_info("multiple source clocks available, postponing sync...");
+		priv->source = NULL;
+		return;
+	}
+	if (src_cnt > 0 && !src) {
+		pr_info("source clock not ready, waiting...");
+		priv->source = NULL;
+		return;
+	}
+	if (!src_cnt && !dst_cnt) {
+		pr_info("no PHC ready, waiting...");
+		priv->source = NULL;
+		return;
+	}
+	if (!src_cnt) {
+		pr_info("nothing to synchronize");
+		priv->source = NULL;
+		return;
+	}
+	src->is_destination = 0;
+	priv->source = src;
+	pr_info("selecting %s as the source clock", src->name);
+}
+
+static void ts2phc_synchronize_clocks(struct ts2phc_private *priv, int autocfg)
 {
 	struct timespec source_ts;
 	uint64_t source_ns;
 	struct clock *c;
 	int valid, err;
 
-	err = ts2phc_master_getppstime(priv->master, &source_ts);
-	if (err < 0) {
-		pr_err("source ts not valid");
-		return;
+	if (autocfg) {
+		if (!priv->source) {
+			pr_debug("no source, skipping");
+			return;
+		}
+		valid = clock_get_tstamp(priv->source, &source_ts);
+		if (!valid) {
+			pr_err("source clock (%s) timestamp not valid, skipping",
+				priv->source->name);
+			return;
+		}
+	} else {
+		err = ts2phc_master_getppstime(priv->master, &source_ts);
+		if (err < 0) {
+			pr_err("source ts not valid");
+			return;
+		}
+		if (source_ts.tv_nsec > NS_PER_SEC / 2)
+			source_ts.tv_sec++;
+		source_ts.tv_nsec = 0;
 	}
-	if (source_ts.tv_nsec > NS_PER_SEC / 2)
-		source_ts.tv_sec++;
-	source_ts.tv_nsec = 0;
 
 	source_ns = source_ts.tv_sec * NS_PER_SEC + source_ts.tv_nsec;
 
@@ -328,6 +413,14 @@ static void ts2phc_synchronize_clocks(struct ts2phc_private *priv)
 		int64_t offset;
 		uint64_t ns;
 		double adj;
+
+		/* TODO: in autocfg mode, we _should_ be able to synchronize
+		 * the PHC master clock. However, using the current kernel API,
+		 * we have no way of deriving a precise offset that we can feed
+		 * into the servo. See the other TODO comment in ts2phc_slave.c.
+		 */
+		if (c == priv->source)
+			continue;
 
 		valid = clock_get_tstamp(c, &ts);
 		if (!valid) {
@@ -561,6 +654,25 @@ int main(int argc, char *argv[])
 	while (is_running()) {
 		struct clock *c;
 
+		if (autocfg) {
+			/*
+			 * Make sure ptp4l sees us as alive and doesn't prune
+			 * us from the list of subscribers
+			 */
+			err = update_pmc_node(&priv.node, 1);
+			if (err < 0) {
+				pr_err("update_pmc_node returned %d", err);
+				break;
+			}
+			err = run_pmc_events(&priv.node);
+			if (err < 0) {
+				pr_err("run_pmc_events returned %d", err);
+				break;
+			}
+			if (priv.state_changed)
+				ts2phc_reconfigure(&priv);
+		}
+
 		LIST_FOREACH(c, &priv.clocks, list)
 			clock_flush_tstamp(c);
 
@@ -570,7 +682,7 @@ int main(int argc, char *argv[])
 			break;
 		}
 		if (err > 0)
-			ts2phc_synchronize_clocks(&priv);
+			ts2phc_synchronize_clocks(&priv, autocfg);
 	}
 
 	ts2phc_cleanup(&priv);
