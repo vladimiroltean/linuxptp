@@ -21,6 +21,10 @@
 #ifndef HAVE_TS2PHC_H
 #define HAVE_TS2PHC_H
 
+#include <sys/queue.h>
+#include <time.h>
+#include "servo.h"
+
 struct ts2phc_slave_array;
 
 #define SERVO_SYNC_INTERVAL    1.0
