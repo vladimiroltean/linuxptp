@@ -42,6 +42,8 @@ struct clock {
 	char *name;
 	int no_adj;
 	int is_destination;
+	int is_ts_available;
+	tmv_t last_ts;
 };
 
 struct port {
@@ -66,7 +68,7 @@ struct ts2phc_private {
 
 struct servo *servo_add(struct ts2phc_private *priv, struct clock *clock);
 struct clock *clock_add(struct ts2phc_private *priv, const char *device);
-void clock_add_tstamp(struct clock *clock, struct timespec ts);
+void clock_add_tstamp(struct clock *clock, tmv_t ts);
 
 #include "ts2phc_master.h"
 #include "ts2phc_slave.h"
