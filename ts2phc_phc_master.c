@@ -83,6 +83,14 @@ static int ts2phc_phc_master_getppstime(struct ts2phc_master *m,
 	return clock_gettime(master->clock->clkid, ts);
 }
 
+struct clock *ts2phc_phc_master_get_clock(struct ts2phc_master *m)
+{
+	struct ts2phc_phc_master *master =
+		container_of(m, struct ts2phc_phc_master, master);
+
+	return master->clock;
+}
+
 struct ts2phc_master *ts2phc_phc_master_create(struct ts2phc_private *priv,
 					       const char *dev)
 {
@@ -94,6 +102,7 @@ struct ts2phc_master *ts2phc_phc_master_create(struct ts2phc_private *priv,
 	}
 	master->master.destroy = ts2phc_phc_master_destroy;
 	master->master.getppstime = ts2phc_phc_master_getppstime;
+	master->master.get_clock = ts2phc_phc_master_get_clock;
 
 	master->clock = clock_add(priv, dev);
 	if (!master->clock) {
@@ -111,4 +120,12 @@ struct ts2phc_master *ts2phc_phc_master_create(struct ts2phc_private *priv,
 	}
 
 	return &master->master;
+}
+
+struct clock *ts2phc_master_get_clock(struct ts2phc_master *m)
+{
+	if (m->get_clock)
+		return m->get_clock(m);
+
+	return NULL;
 }
